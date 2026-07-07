@@ -86,6 +86,17 @@ struct ShellState {
     last_exit: Option<i32>,
 }
 
+/// The shared handles the reader thread writes into as daemon frames arrive;
+/// `RemoteTerminal` keeps the other ends for the view to read. Bundled so
+/// `spawn_reader`'s signature stays readable as signals accrue.
+struct ReaderSignals {
+    cwd: Arc<Mutex<Option<PathBuf>>>,
+    shell: Arc<Mutex<ShellState>>,
+    exited: Arc<AtomicBool>,
+    child_exited: Arc<AtomicBool>,
+    zle_reading: Arc<AtomicBool>,
+}
+
 /// A terminal whose PTY lives in the daemon. Mirrors `backend::Terminal`'s public
 /// surface so the view can treat the two interchangeably.
 pub struct RemoteTerminal {
@@ -117,6 +128,14 @@ pub struct RemoteTerminal {
     /// Set true by the reader thread once the child exits or the daemon
     /// disconnects. `poll_exited()` copies this into the `exited` field.
     exited_flag: Arc<AtomicBool>,
+    /// Set true only on a *genuine* child exit (`DaemonMsg::Exited` — the
+    /// shell ended: `exit`, Ctrl-D, a crash), never on a daemon disconnect or
+    /// protocol desync, which also flip `exited_flag`. The distinction gates
+    /// pane auto-close: a pane whose shell ended closes itself, while a pane
+    /// that merely lost its connection stays visible (auto-closing it would
+    /// silently discard — and `close_tab` would try to kill — a session that
+    /// may still be alive daemon-side).
+    child_exited: Arc<AtomicBool>,
     /// Whether zle is reading the keyboard right now, sniffed client-side from
     /// *live* OSC 133 marks: `B` (prompt end — zle takes over immediately
     /// after) arms it, any other mark disarms it, and Snapshot replays never
@@ -202,16 +221,20 @@ impl RemoteTerminal {
         let cwd: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let shell_state: Arc<Mutex<ShellState>> = Arc::new(Mutex::new(ShellState::default()));
         let exited_flag = Arc::new(AtomicBool::new(false));
+        let child_exited = Arc::new(AtomicBool::new(false));
         let zle_reading = Arc::new(AtomicBool::new(false));
 
         let reader_thread = Self::spawn_reader(
             term.clone(),
             proxy,
             read_half,
-            cwd.clone(),
-            shell_state.clone(),
-            exited_flag.clone(),
-            zle_reading.clone(),
+            ReaderSignals {
+                cwd: cwd.clone(),
+                shell: shell_state.clone(),
+                exited: exited_flag.clone(),
+                child_exited: child_exited.clone(),
+                zle_reading: zle_reading.clone(),
+            },
         );
 
         Ok(Self {
@@ -225,6 +248,7 @@ impl RemoteTerminal {
             cwd,
             shell_state,
             exited_flag,
+            child_exited,
             zle_reading,
             reader_thread: Some(reader_thread),
         })
@@ -246,14 +270,18 @@ impl RemoteTerminal {
         term: Arc<FairMutex<Term<EventProxy>>>,
         proxy: EventProxy,
         read_half: Stream,
-        cwd: Arc<Mutex<Option<PathBuf>>>,
-        shell: Arc<Mutex<ShellState>>,
-        exited_flag: Arc<AtomicBool>,
-        zle_reading: Arc<AtomicBool>,
+        signals: ReaderSignals,
     ) -> JoinHandle<()> {
         std::thread::Builder::new()
             .name("tty7-remote-reader".to_string())
             .spawn(move || {
+                let ReaderSignals {
+                    cwd,
+                    shell,
+                    exited: exited_flag,
+                    child_exited,
+                    zle_reading,
+                } = signals;
                 // The client end of the visible-output path: keep it off the
                 // efficiency cores (see `core::threads`).
                 crate::core::threads::promote_to_user_interactive();
@@ -480,7 +508,13 @@ impl RemoteTerminal {
                                 // Child gone: apply what it printed last, then
                                 // mark the emulator exited and flip the shared
                                 // flag so the next `poll_exited()` surfaces it.
+                                // This is the one exit path where the child
+                                // *really* ended (vs the connection dying), so
+                                // record that before the teardown's events fire
+                                // — the view reads it to decide whether the
+                                // pane should close itself.
                                 flush_batch!();
+                                child_exited.store(true, Ordering::SeqCst);
                                 teardown();
                                 break 'main;
                             }
@@ -579,6 +613,12 @@ impl RemoteTerminal {
         if self.exited_flag.load(Ordering::SeqCst) {
             self.exited = true;
         }
+    }
+
+    /// Whether the pane's child process genuinely exited (as opposed to the
+    /// daemon connection dropping — see the `child_exited` field docs).
+    pub fn child_exited(&self) -> bool {
+        self.child_exited.load(Ordering::SeqCst)
     }
 
     /// Send raw bytes (keyboard input, pasted text, query replies) to the pane as
@@ -963,6 +1003,48 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(term.exited_flag.load(Ordering::SeqCst));
+    }
+
+    /// A `DaemonMsg::Exited` frame (the child really ended) must set
+    /// `child_exited`; a bare daemon disconnect (EOF) must not — both flip
+    /// `exited_flag`. The distinction is what keeps pane auto-close from
+    /// firing on a lost connection and destroying a session that may still be
+    /// alive daemon-side.
+    #[test]
+    fn child_exit_is_distinguished_from_daemon_disconnect() {
+        // A genuine child exit: the daemon reports it explicitly.
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        DaemonMsg::Exited { code: Some(0) }
+            .encode(&mut daemon_side)
+            .unwrap();
+        for _ in 0..200 {
+            if term.exited_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(term.exited_flag.load(Ordering::SeqCst));
+        assert!(
+            term.child_exited(),
+            "an Exited frame is a genuine child exit"
+        );
+
+        // A daemon disconnect: the socket just closes.
+        let (client_side, daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        drop(daemon_side);
+        for _ in 0..200 {
+            if term.exited_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(term.exited_flag.load(Ordering::SeqCst));
+        assert!(
+            !term.child_exited(),
+            "a disconnect is not a child exit — auto-close must not fire"
+        );
     }
 
     /// `stale_mode_resets` maps each residue bit to its reset — and nothing

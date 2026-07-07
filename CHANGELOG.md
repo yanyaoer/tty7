@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Typing `exit` (or Ctrl-D) left a dead "process exited" pane behind instead
+  of closing it. A pane whose shell genuinely ends now closes itself —
+  collapsing its split, or closing the tab when it was the only pane (the
+  last tab falls back to the home page), like every other terminal. A pane
+  that merely *lost its daemon connection* still stays visible: auto-closing
+  those would silently discard — and kill — sessions that may still be alive
+  daemon-side. Panes that died while detached clean themselves up on the next
+  attach the same way.
+
 - A full-screen TUI dying without restoring the terminal — the canonical case
   being an ssh session dropping mid-`htop`/`vim` — left the pane stranded on
   the alt screen with a hidden cursor and live mouse reporting: a visible
