@@ -11,5 +11,6 @@ pub mod actions;
 pub mod config;
 pub mod osc;
 pub mod session;
+pub mod shells;
 pub mod threads;
 pub mod update;

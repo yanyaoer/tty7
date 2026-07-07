@@ -29,6 +29,7 @@ use crate::core::actions::{
     CloseActiveTab, NewTab, SendBackTab, SendTab, SplitDown, SplitRight, ToggleMaximizePane,
 };
 use crate::core::config::{Config, NotifyMode};
+use crate::daemon::protocol::ShellSpec;
 
 // Terminal-scoped actions dispatched by the right-click context menu. They route
 // to this view via `.on_action` handlers on the terminal surface; tab/split
@@ -59,6 +60,11 @@ pub struct TerminalView {
     /// so a restart can re-`attach` to the still-running pane (process + scrollback
     /// intact) instead of spawning a fresh shell.
     pub pane_id: u64,
+    /// The shell this pane was spawned with when the user picked one from the
+    /// new-tab dropdown; `None` for the default shell and for re-attached
+    /// panes. In-memory only (not persisted) — held so splits of this pane
+    /// inherit the same shell.
+    shell_spec: Option<ShellSpec>,
     pub focus_handle: FocusHandle,
     pub font: Font,
     /// Optional distinct base face for bold cells (from `font_family_bold`), with
@@ -364,22 +370,38 @@ impl TerminalView {
     pub fn new(
         working_directory: Option<std::path::PathBuf>,
         restore_pane: Option<u64>,
+        shell: Option<ShellSpec>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<Self> {
         // Provisional size; corrected on the first prepaint once we can measure.
         // The PTY lives in the daemon now. On session restore (`restore_pane`),
         // re-`attach` to the still-running pane so its process + scrollback come
-        // back intact; otherwise `spawn` a fresh pane. The caller only passes a
-        // `restore_pane` it has already confirmed alive, so we trust it here.
-        let (terminal, pane_id) = match restore_pane {
+        // back intact; otherwise `spawn` a fresh pane (with the caller's shell
+        // pick, if any). The caller only passes a `restore_pane` it has already
+        // confirmed alive, so we trust it here.
+        let (terminal, pane_id, shell_spec) = match restore_pane {
             Some(id) => (
                 RemoteTerminal::attach(TermSize::new(80, 24), 8, 17, id)?,
                 id,
+                // An attached pane keeps whatever shell it already runs; the
+                // pick that spawned it (if any) isn't persisted.
+                None,
             ),
-            None => RemoteTerminal::spawn(TermSize::new(80, 24), 8, 17, working_directory)?,
+            None => {
+                let (terminal, id) = RemoteTerminal::spawn(
+                    TermSize::new(80, 24),
+                    8,
+                    17,
+                    working_directory,
+                    shell.clone(),
+                )?;
+                (terminal, id, shell)
+            }
         };
-        Ok(Self::with_terminal(terminal, pane_id, window, cx))
+        let mut view = Self::with_terminal(terminal, pane_id, window, cx);
+        view.shell_spec = shell_spec;
+        Ok(view)
     }
 
     /// Build the view around an already-connected terminal. Split from [`new`]
@@ -548,6 +570,7 @@ impl TerminalView {
         Self {
             terminal,
             pane_id,
+            shell_spec: None,
             focus_handle,
             font,
             font_bold,
@@ -609,6 +632,12 @@ impl TerminalView {
     /// new tabs / splits can open in the same place. `None` if it can't be read.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
         self.terminal.foreground_cwd()
+    }
+
+    /// The shell this pane was explicitly spawned with (new-tab dropdown pick),
+    /// so splits can inherit it. `None` → the default shell.
+    pub fn shell_spec(&self) -> Option<ShellSpec> {
+        self.shell_spec.clone()
     }
 
     fn handle_event(&mut self, ev: AlacEvent, cx: &mut Context<Self>) {
