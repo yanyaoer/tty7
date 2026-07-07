@@ -1644,21 +1644,10 @@ impl Tty7App {
 
     /// Open the GitHub Releases page in the browser — the "Download" action of
     /// the Settings → About update prompt. Deliberately hand-off, not
-    /// self-update: the newest build is one click away on the web.
+    /// self-update: the newest build is one click away on the web. Delegates to
+    /// `core::update` so the settings button and the update modal share it.
     pub(crate) fn open_releases_page(&self) {
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else if cfg!(windows) {
-            "explorer"
-        } else {
-            "xdg-open"
-        };
-        if let Err(e) = std::process::Command::new(opener)
-            .arg(crate::core::update::RELEASES_URL)
-            .spawn()
-        {
-            log::warn!("failed to open releases page: {e}");
-        }
+        crate::core::update::open_releases_page();
     }
 }
 

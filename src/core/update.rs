@@ -14,9 +14,10 @@
 
 use anyhow::{Context as _, Result};
 use gpui::http_client::{AsyncBody, HttpClient as _, HttpRequestExt as _, RedirectPolicy};
-use gpui::{App, Global, http_client};
+use gpui::{AnyWindowHandle, App, AsyncApp, Global, PromptLevel, Window, http_client};
 use reqwest_client::ReqwestClient;
 use smol::io::AsyncReadExt as _;
+use std::time::Duration;
 
 use crate::core::config::Config;
 
@@ -48,8 +49,12 @@ pub struct UpdateStatus {
 impl Global for UpdateStatus {}
 
 /// Kick off the background update check. Returns immediately; the network work
-/// runs on a detached task and, if a newer version exists, writes the
-/// [`UpdateStatus`] global and repaints so an already-open About panel updates.
+/// runs on a detached task and, if a newer version exists:
+///   1. writes the [`UpdateStatus`] global (the passive Settings → About prompt,
+///      shown on every launch while outdated), and
+///   2. pops a one-time modal dialog for that version — but only the first
+///      launch it's seen; the version is remembered in `update.json` so we never
+///      nag twice for the same release.
 ///
 /// Honors `config.check_for_updates`: when off, we make no network call at all.
 pub fn spawn_check(cx: &mut App) {
@@ -76,16 +81,147 @@ pub fn spawn_check(cx: &mut App) {
 
         let version = latest.trim_start_matches('v').to_string();
         log::info!("update available: {version} (running {current})");
-        let _ = cx.update(|cx| {
+
+        // Record it for the passive Settings → About prompt and repaint so an
+        // already-open About picks it up now rather than on the next interaction.
+        cx.update(|cx| {
             cx.set_global(UpdateStatus {
-                available: Some(AvailableUpdate { version }),
+                available: Some(AvailableUpdate {
+                    version: version.clone(),
+                }),
             });
-            // Repaint so a Settings → About that's already open shows the prompt
-            // now rather than only on the next interaction.
             cx.refresh_windows();
         });
+
+        // Active modal: pop exactly once per version. If a previous launch
+        // already showed it for this version, stop here — About still carries
+        // the passive prompt.
+        if UpdateState::load().last_prompted.as_deref() == Some(version.as_str()) {
+            return;
+        }
+
+        // The check can outrace the window-open task at startup; wait briefly
+        // for a window to host the modal before giving up.
+        let Some(window) = wait_for_window(cx).await else {
+            return;
+        };
+        let shown = cx.update(|cx| {
+            window
+                .update(cx, |_root, window, cx| prompt_update(&version, window, cx))
+                .is_ok()
+        });
+
+        // Persist only after the modal actually went up, so a version we never
+        // managed to show still gets its one prompt on a later launch.
+        if shown {
+            UpdateState {
+                last_prompted: Some(version),
+            }
+            .save();
+        }
     })
     .detach();
+}
+
+/// Poll (briefly) for the app's main window. Returns `None` if none appears
+/// within the window — treated as "no host for the modal", so we simply skip it.
+async fn wait_for_window(cx: &mut AsyncApp) -> Option<AnyWindowHandle> {
+    // ~5s of 100ms ticks. The network round-trip almost always finishes after
+    // the window is already up, so this usually returns on the first poll.
+    for _ in 0..50 {
+        if let Some(handle) = cx.update(|cx| cx.windows().first().copied()) {
+            return Some(handle);
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+    }
+    None
+}
+
+/// Show the one-time "update available" modal, and open the Releases page if the
+/// user picks Download. Mirrors the window-close confirmation's prompt style.
+fn prompt_update(version: &str, window: &mut Window, cx: &mut App) {
+    let detail = format!(
+        "tty7 {version} is available — you're on {}. Open the download page to get it.",
+        env!("CARGO_PKG_VERSION")
+    );
+    // Index 1 == "Download"; index 0 (Later) and a dismissed prompt do nothing.
+    let answer = window.prompt(
+        PromptLevel::Info,
+        "Update available",
+        Some(&detail),
+        &["Later", "Download"],
+        cx,
+    );
+    cx.spawn(async move |_cx| {
+        if let Ok(1) = answer.await {
+            open_releases_page();
+        }
+    })
+    .detach();
+}
+
+/// Open the GitHub Releases page with the OS default handler. Shared by the
+/// modal's Download button and the Settings → About Download button.
+pub fn open_releases_page() {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    if let Err(e) = std::process::Command::new(opener).arg(RELEASES_URL).spawn() {
+        log::warn!("failed to open releases page: {e}");
+    }
+}
+
+/// Tiny persisted state for the update checker, stored at `update.json` in the
+/// config dir (alongside `config.json` / `session.json`). Currently just the
+/// last version we popped the modal for, so we never nag twice for one release.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct UpdateState {
+    #[serde(default)]
+    last_prompted: Option<String>,
+}
+
+impl UpdateState {
+    fn path() -> Option<std::path::PathBuf> {
+        crate::core::config::config_path("update.json")
+    }
+
+    /// Load persisted state; a missing / unreadable / malformed file all yield
+    /// the default (never prompted), so at worst we prompt once more.
+    fn load() -> Self {
+        let Some(path) = Self::path() else {
+            return Self::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        serde_json::from_str(&text).unwrap_or_else(|e| {
+            log::warn!("failed to parse {}: {e}; ignoring", path.display());
+            Self::default()
+        })
+    }
+
+    /// Persist state; IO / serialization errors are logged and swallowed.
+    fn save(&self) {
+        let Some(path) = Self::path() else {
+            return;
+        };
+        let json = match serde_json::to_string_pretty(self) {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("failed to serialize update state: {e}");
+                return;
+            }
+        };
+        if let Err(e) = crate::core::config::write_atomic(&path, json.as_bytes()) {
+            log::warn!("failed to write {}: {e}", path.display());
+        }
+    }
 }
 
 /// The `tag_name` field of GitHub's release payload — the only piece we read.
@@ -195,5 +331,29 @@ mod tests {
     fn unparseable_tag_never_prompts() {
         assert!(!is_update_available("garbage", "0.3.0"));
         assert!(!is_update_available("v0.3.1", "garbage"));
+    }
+
+    #[test]
+    fn update_state_round_trips_and_defaults() {
+        // Pin a throwaway config dir (first-call-wins; same scheme the session
+        // tests use, so the whole test binary shares one temp dir).
+        let dir = std::env::temp_dir().join(format!("tty7-covtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        crate::core::config::set_config_dir(dir);
+        let path = UpdateState::path().expect("config dir pinned");
+
+        // Missing file → default (never prompted), so we'd prompt.
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(UpdateState::load().last_prompted, None);
+
+        // A recorded version round-trips, so a second launch skips the modal.
+        UpdateState {
+            last_prompted: Some("0.4.0".into()),
+        }
+        .save();
+        assert_eq!(UpdateState::load().last_prompted.as_deref(), Some("0.4.0"));
+
+        // Don't leak state into other runs sharing the pinned dir.
+        let _ = std::fs::remove_file(&path);
     }
 }
