@@ -1980,6 +1980,26 @@ impl TerminalView {
     /// query/match logic (`reverse_search` module); the view just applies the
     /// resulting [`reverse_search::Action`] and repaints.
     fn handle_reverse_search_key(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) {
+        // Printable text typed into the query. A CJK input source routes it through
+        // the IME (`input_text` → `push_query`), but a plain ASCII input source —
+        // and Linux, where `prefers_ime_for_printable_keys` is false — delivers it
+        // here as an ordinary key event carrying `key_char`. Without this the search
+        // field can only be typed into via an IME: Ctrl+R opens, but ASCII
+        // keystrokes vanish. Mirror the editor's `key_char` path (`handle_editor_key`);
+        // control / Cmd / Alt chords and non-printable keys (Enter/Backspace/Esc have
+        // no printable `key_char`) fall through to the control-key handling below.
+        let m = &ks.modifiers;
+        if !m.control && !m.platform && !m.alt {
+            if let Some(ch) = ks.key_char.as_deref() {
+                if !ch.is_empty() && ch.chars().all(|c| c >= '\u{20}' && c != '\u{7f}') {
+                    if let Some(rs) = self.reverse_search.as_mut() {
+                        rs.push_query(ch, &self.history);
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         let Some(rs) = self.reverse_search.as_mut() else {
             return;
         };
