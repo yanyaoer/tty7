@@ -12,3 +12,4 @@ pub mod config;
 pub mod osc;
 pub mod session;
 pub mod threads;
+pub mod update;
