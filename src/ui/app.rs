@@ -208,7 +208,13 @@ impl Tty7App {
             let shells = cx
                 .background_spawn(async { crate::core::shells::detect_shells() })
                 .await;
-            let _ = this.update(cx, |app, _| app.detected_shells = shells);
+            // `notify` so the strip re-renders and the dropdown closure
+            // captures the freshly landed list (nothing else is guaranteed to
+            // redraw an idle window).
+            let _ = this.update(cx, |app, cx| {
+                app.detected_shells = shells;
+                cx.notify();
+            });
         })
         .detach();
         // Persist the session one last time as the app quits. This captures the
