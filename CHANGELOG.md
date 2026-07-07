@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Startup update check: tty7 asks GitHub once, in the background, whether a
+  newer release has shipped and — if so — shows a "Download" prompt in
+  Settings → About that opens the Releases page. It never downloads or updates
+  itself; you still install by hand. Turn the check off with `check_for_updates`
+  in `config.json` or the "Check for updates on launch" toggle in About. A
+  failed or offline check is silent.
 - ⌘K (Ctrl+K on Windows/Linux) clears the screen and scrollback — the same
   "Clear" the right-click menu already offered, now on the keyboard shortcut
   Terminal.app, iTerm2, and Ghostty users expect. Also available from the

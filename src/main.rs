@@ -261,6 +261,10 @@ fn main() {
             crate::ui::theme::apply_cursor_hide_mode(cx);
             // Start watching `config.json` so edits hot-reload theme/colors live.
             spawn_config_watcher(cx);
+            // Ask GitHub (once, in the background) whether a newer release exists;
+            // if so, Settings → About surfaces a download prompt. Fails soft and
+            // is a no-op when `check_for_updates` is disabled.
+            crate::core::update::spawn_check(cx);
             keymap::init(cx);
 
             cx.spawn(async move |cx| {
