@@ -10,8 +10,11 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, Size, h_flex};
 
+use crate::core::config::Config;
+use crate::daemon::protocol::ShellSpec;
 use crate::ui::app::{Tab, Tty7App};
 use crate::ui::hints::tab_badge_label;
 
@@ -329,55 +332,73 @@ impl Tty7App {
             strip = strip.child(chip);
         }
 
-        // "+" new-tab button — a title-bar tile in the tab row's rhythm.
-        strip =
-            strip.child(
-                self.title_bar_tile("tab-add", IconName::Plus, cx, |this, window, cx| {
-                    this.new_tab(window, cx);
-                }),
-            );
+        // "+" new-tab button — click opens the shell picker. The default shell
+        // leads the menu (so the common case is two quick clicks on the same
+        // spot; ⌘T still opens a default tab in one), followed by every shell
+        // discovered on this machine (`detected_shells`, probed at startup).
+        // Built on gpui-component's `DropdownMenu`, which is only implemented
+        // for `Button` — hence a ghost Button restyled to the title bar's 30px
+        // tile rhythm (30px box, 15px glyph, soft corners) rather than the
+        // hand-rolled tile the "+" used to be.
+        let shells = self.detected_shells.clone();
+        let default_name = crate::core::shells::default_shell_name(
+            cx.global::<Config>()
+                .shell
+                .as_ref()
+                .map(|s| s.program.as_str()),
+        );
+        let app = cx.entity().downgrade();
+        strip = strip.child(
+            // Same Windows titlebar note as the chips above: `occlude()` gives
+            // the trigger a BlockMouse hitbox so the TitleBar's HTCAPTION drag
+            // area doesn't swallow the click.
+            div().occlude().flex_shrink_0().child(
+                Button::new("tab-add")
+                    .icon(Icon::new(IconName::Plus).size(px(15.)))
+                    .ghost()
+                    .xsmall()
+                    .w(px(30.))
+                    .h(px(30.))
+                    .rounded_lg()
+                    .dropdown_menu(move |menu, _window, _cx| {
+                        let mut menu = menu.with_size(Size::Small).min_w(px(220.));
+                        // Default first — what a bare "new tab" means today,
+                        // named so the fallback is legible ("New Tab (zsh)").
+                        let open_default = app.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(format!("New Tab ({default_name})")).on_click(
+                                move |_, window, cx| {
+                                    if let Some(app) = open_default.upgrade() {
+                                        app.update(cx, |this, cx| this.new_tab(window, cx));
+                                    }
+                                },
+                            ),
+                        );
+                        if !shells.is_empty() {
+                            menu = menu.separator();
+                        }
+                        for shell in &shells {
+                            let spec = ShellSpec {
+                                program: shell.program.clone(),
+                                args: shell.args.clone(),
+                            };
+                            let open = app.clone();
+                            menu = menu.item(PopupMenuItem::new(shell.label.clone()).on_click(
+                                move |_, window, cx| {
+                                    if let Some(app) = open.upgrade() {
+                                        app.update(cx, |this, cx| {
+                                            this.new_tab_with_shell(Some(spec.clone()), window, cx);
+                                        });
+                                    }
+                                },
+                            ));
+                        }
+                        menu
+                    }),
+            ),
+        );
 
         strip
-    }
-
-    /// A minimal clickable icon tile sized to sit in the title bar's rhythm:
-    /// chip-height (30px) box, chip-sized (15px) glyph, quiet hover. We hand-roll
-    /// it because gpui-component's Button locks its glyph to 0.75× the box, so it
-    /// can't hit a 30px target with a 15px glyph — Button's xsmall would float a
-    /// 20px square beside the 30px chips. `occlude()` makes the tile a `BlockMouse`
-    /// hitbox — like the chips — so on Windows the click isn't swallowed by the
-    /// TitleBar's `HTCAPTION` drag area; mouse-down + stop_propagation also keeps
-    /// the click off the TitleBar's zoom-on-double-click handler. Shared by the
-    /// "+" new-tab button and the split-pane buttons.
-    fn title_bar_tile<F>(
-        &self,
-        id: &'static str,
-        icon: IconName,
-        cx: &mut Context<Self>,
-        on_click: F,
-    ) -> impl IntoElement + use<F>
-    where
-        F: Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    {
-        div()
-            .id(id)
-            .occlude()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(30.))
-            .rounded_lg()
-            .text_color(cx.theme().muted_foreground)
-            .hover(|s| s.bg(cx.theme().muted))
-            .child(Icon::new(icon).size(px(15.)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    on_click(this, window, cx);
-                }),
-            )
     }
 }
 

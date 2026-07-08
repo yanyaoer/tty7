@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The "+" button now opens a shell picker: tty7 detects the shells installed
+  on this machine (the login shell plus `/etc/shells` on Unix; PowerShell 7,
+  Windows PowerShell, Command Prompt, Git Bash and WSL distributions on
+  Windows) and lists them in a dropdown, so opening a tab in a different shell
+  no longer requires editing `config.json`. The default entry leads the menu,
+  ⌘T / Ctrl+T still opens a default tab in one keystroke, and splitting a pane
+  inherits its shell — a fish tab splits into more fish, not back to the
+  default. Shells picked this way aren't remembered across restarts (restored
+  panes re-attach to their still-running shells anyway).
+
+### Changed
+
+- The Windows default shell now prefers PowerShell 7 (`pwsh.exe`) when
+  installed — probed across Program Files (x64/x86/ARM), the Microsoft Store,
+  scoop, dotnet tools and `PATH` — and falls back to Windows PowerShell as
+  before. Set `shell` in `config.json` to override, as ever.
+
 ## [0.5.0] - 2026-07-07
 
 ### Added

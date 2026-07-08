@@ -728,7 +728,8 @@ impl Tty7App {
     /// Shell section: the program tty7 launches in each new terminal, plus its
     /// launch arguments. Both apply to *newly spawned* panes/tabs — existing
     /// shells keep running until closed. An empty program falls back to the
-    /// platform default (the login shell on Unix, PowerShell on Windows).
+    /// platform default (the login shell on Unix; PowerShell 7 when installed,
+    /// else Windows PowerShell, on Windows).
     fn render_settings_shell(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted_fg = cx.theme().muted_foreground;
         let (program_input, args_input, wd_path_input) = match self.active_settings() {
