@@ -29,6 +29,7 @@ use crate::core::actions::{
     CloseActiveTab, NewTab, SendBackTab, SendTab, SplitDown, SplitRight, ToggleMaximizePane,
 };
 use crate::core::config::{Config, NotifyMode};
+use crate::daemon::protocol::ShellSpec;
 
 // Terminal-scoped actions dispatched by the right-click context menu. They route
 // to this view via `.on_action` handlers on the terminal surface; tab/split
@@ -59,6 +60,11 @@ pub struct TerminalView {
     /// so a restart can re-`attach` to the still-running pane (process + scrollback
     /// intact) instead of spawning a fresh shell.
     pub pane_id: u64,
+    /// The shell this pane was spawned with when the user picked one from the
+    /// new-tab dropdown; `None` for the default shell and for re-attached
+    /// panes. In-memory only (not persisted) — held so splits of this pane
+    /// inherit the same shell.
+    shell_spec: Option<ShellSpec>,
     pub focus_handle: FocusHandle,
     pub font: Font,
     /// Optional distinct base face for bold cells (from `font_family_bold`), with
@@ -364,22 +370,38 @@ impl TerminalView {
     pub fn new(
         working_directory: Option<std::path::PathBuf>,
         restore_pane: Option<u64>,
+        shell: Option<ShellSpec>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<Self> {
         // Provisional size; corrected on the first prepaint once we can measure.
         // The PTY lives in the daemon now. On session restore (`restore_pane`),
         // re-`attach` to the still-running pane so its process + scrollback come
-        // back intact; otherwise `spawn` a fresh pane. The caller only passes a
-        // `restore_pane` it has already confirmed alive, so we trust it here.
-        let (terminal, pane_id) = match restore_pane {
+        // back intact; otherwise `spawn` a fresh pane (with the caller's shell
+        // pick, if any). The caller only passes a `restore_pane` it has already
+        // confirmed alive, so we trust it here.
+        let (terminal, pane_id, shell_spec) = match restore_pane {
             Some(id) => (
                 RemoteTerminal::attach(TermSize::new(80, 24), 8, 17, id)?,
                 id,
+                // An attached pane keeps whatever shell it already runs; the
+                // pick that spawned it (if any) isn't persisted.
+                None,
             ),
-            None => RemoteTerminal::spawn(TermSize::new(80, 24), 8, 17, working_directory)?,
+            None => {
+                let (terminal, id) = RemoteTerminal::spawn(
+                    TermSize::new(80, 24),
+                    8,
+                    17,
+                    working_directory,
+                    shell.clone(),
+                )?;
+                (terminal, id, shell)
+            }
         };
-        Ok(Self::with_terminal(terminal, pane_id, window, cx))
+        let mut view = Self::with_terminal(terminal, pane_id, window, cx);
+        view.shell_spec = shell_spec;
+        Ok(view)
     }
 
     /// Build the view around an already-connected terminal. Split from [`new`]
@@ -548,6 +570,7 @@ impl TerminalView {
         Self {
             terminal,
             pane_id,
+            shell_spec: None,
             focus_handle,
             font,
             font_bold,
@@ -609,6 +632,12 @@ impl TerminalView {
     /// new tabs / splits can open in the same place. `None` if it can't be read.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
         self.terminal.foreground_cwd()
+    }
+
+    /// The shell this pane was explicitly spawned with (new-tab dropdown pick),
+    /// so splits can inherit it. `None` → the default shell.
+    pub fn shell_spec(&self) -> Option<ShellSpec> {
+        self.shell_spec.clone()
     }
 
     fn handle_event(&mut self, ev: AlacEvent, cx: &mut Context<Self>) {
@@ -711,7 +740,19 @@ impl TerminalView {
         if self.terminal.exited {
             return;
         }
-        let ks = &ev.keystroke;
+        // macOS Option-key policy (see `input::reshape_option_keystroke`):
+        // reshape the chord once, up front, so every consumer below — the ⌘
+        // dispatcher, the prompt editor, the raw PTY encoder — sees the same
+        // story. Other platforms have no composed-character split to resolve.
+        let reshaped = if cfg!(target_os = "macos") {
+            super::input::reshape_option_keystroke(
+                &ev.keystroke,
+                cx.global::<Config>().macos_option_as_alt,
+            )
+        } else {
+            None
+        };
+        let ks = reshaped.as_ref().unwrap_or(&ev.keystroke);
         let m = &ks.modifiers;
 
         // While the search field is focused it owns the keyboard — typing, caret
@@ -1046,6 +1087,36 @@ impl TerminalView {
             self.apply_readline_ctrl(key);
             cx.notify();
             return;
+        }
+
+        // Readline-style Meta word chords on the edited line: M-b / M-f motions
+        // and M-d delete-word, mirroring the Alt+←/→/Delete handling below. On
+        // macOS these are reachable only with `macos_option_as_alt` on — with it
+        // off the chord composes a character upstream and arrives here altless,
+        // through the printable-text arm. Other Alt+letter chords stay swallowed
+        // no-ops as before (the local editor can't mirror every zle widget).
+        if m.alt && !m.platform && !m.control {
+            match key {
+                "b" => {
+                    self.editor_move_h(false, m.shift, true);
+                    cx.notify();
+                    return;
+                }
+                "f" => {
+                    self.editor_move_h(true, m.shift, true);
+                    cx.notify();
+                    return;
+                }
+                "d" => {
+                    if !self.cmd.delete_selection() {
+                        self.cmd.delete_word_right();
+                    }
+                    self.history_nav = None;
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
         }
 
         match key {
@@ -3902,6 +3973,45 @@ mod gpui_tests {
                 _ => continue,
             }
         }
+    }
+
+    /// Readline's Meta word chords act on the local prompt editor: M-b / M-f
+    /// move by word, M-d deletes the word right of the caret. (On macOS these
+    /// chords reach the editor only with `macos_option_as_alt` on — the
+    /// `on_key_down` reshape otherwise strips the alt bit; here we drive the
+    /// editor dispatcher directly with the post-reshape keystroke.)
+    #[gpui::test]
+    fn meta_word_chords_edit_the_prompt_line(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                let meta = |key: &str| gpui::Keystroke {
+                    modifiers: gpui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    key: key.to_string(),
+                    key_char: None,
+                };
+                view.cmd.set("echo hello");
+                // M-b from the end lands at the start of "hello".
+                view.handle_editor_key(&meta("b"), cx);
+                assert_eq!(view.cmd.cursor(), 5);
+                // M-d deletes the word right of the caret.
+                view.handle_editor_key(&meta("d"), cx);
+                assert_eq!(view.cmd.text(), "echo ");
+                // M-b / M-f hop the remaining word: back to its start, then
+                // forward to its end.
+                view.handle_editor_key(&meta("b"), cx);
+                assert_eq!(view.cmd.cursor(), 0);
+                view.handle_editor_key(&meta("f"), cx);
+                assert_eq!(view.cmd.cursor(), 4);
+                // Other Meta letters stay swallowed no-ops (line untouched).
+                view.handle_editor_key(&meta("z"), cx);
+                assert_eq!(view.cmd.text(), "echo ");
+                assert_eq!(view.cmd.cursor(), 4);
+            })
+            .unwrap();
     }
 
     /// A `PtyWrite` raised by the VT layer (query replies, bracketed-paste

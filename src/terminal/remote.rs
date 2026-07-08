@@ -34,7 +34,7 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi;
 
 use crate::core::osc::OscTokenizer;
-use crate::daemon::protocol::{ClientMsg, DaemonMsg, WinSize};
+use crate::daemon::protocol::{ClientMsg, DaemonMsg, ShellSpec, WinSize};
 use crate::daemon::transport::{self, Stream};
 
 use super::size::TermSize;
@@ -147,16 +147,20 @@ pub struct RemoteTerminal {
 
 impl RemoteTerminal {
     /// Connect to the daemon, spawn a fresh pane (shell) sized to `size`, and
-    /// start mirroring it. Returns the terminal plus the daemon-assigned
-    /// `pane_id` (the caller persists it for later session restore / `attach`).
+    /// start mirroring it. `shell` is the user's dropdown pick, overriding the
+    /// daemon's default shell resolution; `None` spawns the default. Returns
+    /// the terminal plus the daemon-assigned `pane_id` (the caller persists it
+    /// for later session restore / `attach`).
     pub fn spawn(
         size: TermSize,
         cell_w: u16,
         cell_h: u16,
         cwd: Option<PathBuf>,
+        shell: Option<ShellSpec>,
     ) -> anyhow::Result<(Self, u64)> {
         let retry_cwd = cwd.clone();
-        match Self::spawn_once(size, cell_w, cell_h, cwd) {
+        let retry_shell = shell.clone();
+        match Self::spawn_once(size, cell_w, cell_h, cwd, shell) {
             Ok(term) => Ok(term),
             Err(first_err) if daemon_disconnected_before_spawn_reply(&first_err) => {
                 // A live-but-old daemon can accept the connection, panic while
@@ -168,7 +172,7 @@ impl RemoteTerminal {
                         "daemon disconnected before Spawn reply ({first_err}); restart failed: {restart_err}"
                     ));
                 }
-                Self::spawn_once(size, cell_w, cell_h, retry_cwd).map_err(|second_err| {
+                Self::spawn_once(size, cell_w, cell_h, retry_cwd, retry_shell).map_err(|second_err| {
                     anyhow::anyhow!(
                         "daemon disconnected before Spawn reply ({first_err}); restarted daemon but Spawn still failed: {second_err}"
                     )
@@ -183,6 +187,7 @@ impl RemoteTerminal {
         cell_w: u16,
         cell_h: u16,
         cwd: Option<PathBuf>,
+        shell: Option<ShellSpec>,
     ) -> anyhow::Result<(Self, u64)> {
         let mut stream = connect()?;
         let win = win_size(size, cell_w, cell_h);
@@ -190,7 +195,12 @@ impl RemoteTerminal {
         // Ask the daemon to create the pane, then read its assigned id back. The
         // very next frames on this connection are this pane's Snapshot + Output,
         // which the reader thread (started below) will consume.
-        ClientMsg::Spawn { cwd, size: win }.encode(&mut stream)?;
+        ClientMsg::Spawn {
+            cwd,
+            size: win,
+            shell,
+        }
+        .encode(&mut stream)?;
         let pane_id = match DaemonMsg::read(&mut stream)? {
             DaemonMsg::Spawned { pane_id } => pane_id,
             DaemonMsg::Error(msg) => {
