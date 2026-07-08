@@ -1,0 +1,100 @@
+name: Nightly Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: package nightly (${{ matrix.os }}-${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            os: macos
+            arch: arm64
+            target: aarch64-apple-darwin
+          # macos-13 was retired; macos-15-intel is the remaining hosted x86_64 image.
+          - runner: macos-15-intel
+            os: macos
+            arch: x86_64
+            target: x86_64-apple-darwin
+          - runner: windows-latest
+            os: windows
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout tty7
+        uses: actions/checkout@v4
+        with:
+          path: tty7
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config cmake clang libxkbcommon-dev \
+            libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
+            libwayland-dev libx11-dev libxcb1-dev libzstd-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tty7
+
+      - name: Build release binary
+        working-directory: tty7
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Bundle macOS DMG
+        if: matrix.os == 'macos'
+        working-directory: tty7
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash .github/scripts/bundle-macos.sh "${{ matrix.target }}" "${{ matrix.arch }}"
+
+      - name: Package Linux tarball
+        if: matrix.os == 'linux'
+        working-directory: tty7
+        run: bash .github/scripts/bundle-linux.sh "${{ matrix.target }}" "${{ matrix.arch }}"
+
+      - name: Package Windows installer and zip
+        if: matrix.os == 'windows'
+        working-directory: tty7
+        shell: pwsh
+        run: '& ./.github/scripts/bundle-windows.ps1 "${{ matrix.target }}" "${{ matrix.arch }}"'
+
+      - name: Upload nightly package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tty7-nightly-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            tty7/dist/*.dmg
+            tty7/dist/*.tar.gz
+            tty7/dist/*.zip
+            tty7/dist/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
