@@ -35,41 +35,37 @@ use std::time::Duration;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::core::osc::OscTokenizer;
-use crate::daemon::protocol::{DaemonMsg, PaneInfo, WinSize};
+use crate::daemon::protocol::{DaemonMsg, PaneInfo, ShellSpec, WinSize};
 use crate::daemon::shell_integration;
 
-/// The Windows default shell. `powershell.exe` (Windows PowerShell 5.1) ships
-/// with every supported Windows, so it always resolves — users who prefer
-/// `pwsh` 7+ or `cmd` can set `shell` in config. This is also the name shell
-/// integration keys off (see [`default_shell_name`]).
-#[cfg(windows)]
-const WINDOWS_DEFAULT_SHELL: &str = "powershell.exe";
-
 /// The platform default shell command, used when the user hasn't set `shell` in
-/// `config.json`. Windows is explicit (`powershell.exe`); Unix starts from
-/// portable-pty's login-shell builder, but can switch to an explicit shell when
-/// the GUI detected the shell that launched tty7 and forwarded it to the daemon.
+/// `config.json`. On Windows `portable-pty`'s own default is `%COMSPEC%`
+/// (i.e. `cmd.exe`); we override it to PowerShell — PowerShell 7 (`pwsh`) when
+/// installed, probed once by `core::shells`, else the `powershell.exe` that
+/// ships with every supported Windows. Mirrors Warp / Windows Terminal's
+/// preference for the modern shell.
 #[cfg(windows)]
-fn default_shell_command() -> (CommandBuilder, String) {
-    (
-        CommandBuilder::new(WINDOWS_DEFAULT_SHELL),
-        WINDOWS_DEFAULT_SHELL.to_string(),
-    )
+fn default_prog() -> CommandBuilder {
+    CommandBuilder::new(crate::core::shells::windows_default_shell())
+}
+
+/// On Unix, start from `portable-pty`'s login-shell builder, but switch to an
+/// explicit command when the GUI has already detected the shell that launched
+/// tty7 and forwarded it to the detached daemon. LaunchServices may otherwise
+/// give the daemon a stale config dir and stale `$SHELL`.
+#[cfg(not(windows))]
+fn default_prog() -> CommandBuilder {
+    default_prog_with_override(detected_shell_override())
 }
 
 #[cfg(not(windows))]
-fn default_shell_command() -> (CommandBuilder, String) {
-    default_shell_command_with_override(detected_shell_override())
-}
-
-#[cfg(not(windows))]
-fn default_shell_command_with_override(shell_override: Option<String>) -> (CommandBuilder, String) {
+fn default_prog_with_override(shell_override: Option<String>) -> CommandBuilder {
     let cmd = CommandBuilder::new_default_prog();
     let portable_shell = cmd.get_shell();
     if let Some(shell) = shell_override.filter(|shell| shell != &portable_shell) {
-        return (CommandBuilder::new(&shell), shell);
+        return CommandBuilder::new(&shell);
     }
-    (cmd, portable_shell)
+    cmd
 }
 
 #[cfg(not(windows))]
@@ -85,6 +81,33 @@ fn usable_shell_path(path: std::ffi::OsString) -> Option<String> {
         return None;
     }
     path.into_os_string().into_string().ok()
+}
+
+/// The program name used to detect which shell integration applies for the
+/// *default* shell. On Unix this is the login shell `portable-pty` resolved
+/// (`$SHELL` / passwd). On Windows we can't ask the builder: its `get_shell()`
+/// reports `%ComSpec%` (cmd.exe) regardless of what we actually spawn, so it
+/// would send integration detection chasing cmd.exe and never engage — return
+/// the same PowerShell `default_prog()` resolved instead.
+#[cfg(windows)]
+fn default_shell_name(_cmd: &CommandBuilder) -> String {
+    crate::core::shells::windows_default_shell().to_string()
+}
+
+#[cfg(not(windows))]
+fn default_shell_name(cmd: &CommandBuilder) -> String {
+    cmd.get_shell()
+}
+
+/// Which shell a spawn launches, by precedence: the explicit per-spawn override
+/// (the new-tab dropdown) > the configured `shell` in `config.json` > `None`,
+/// meaning the platform default (`default_prog()`). Kept as a function so the
+/// contract is stated (and tested) in one place.
+fn choose_shell(
+    spawn_override: Option<ShellSpec>,
+    configured: Option<(String, Vec<String>)>,
+) -> Option<(String, Vec<String>)> {
+    spawn_override.map(|s| (s.program, s.args)).or(configured)
 }
 
 fn apply_shell_integration(
@@ -271,31 +294,43 @@ pub struct DaemonPane {
 
 impl DaemonPane {
     /// Spawn the user's shell on a fresh PTY in `cwd`, sized to `size`, and start
-    /// its reader thread. `id` is the registry id the server assigns. `on_dead`
-    /// fires (from the reader thread) when the child exits while *nobody is
-    /// attached* — the case where no connection's detach would ever reclaim the
-    /// pane; the server uses it to drop the dead pane from its registry instead
-    /// of leaking the zombie child + replay ring for the daemon's lifetime.
+    /// its reader thread. `id` is the registry id the server assigns. `shell` is
+    /// an explicit per-spawn override (the new-tab dropdown) that outranks the
+    /// configured default — see [`choose_shell`]. `on_dead` fires (from the
+    /// reader thread) when the child exits while *nobody is attached* — the case
+    /// where no connection's detach would ever reclaim the pane; the server uses
+    /// it to drop the dead pane from its registry instead of leaking the zombie
+    /// child + replay ring for the daemon's lifetime.
     pub fn spawn(
         id: u64,
         cwd: Option<PathBuf>,
         size: WinSize,
+        shell: Option<ShellSpec>,
         on_dead: impl FnOnce() + Send + 'static,
     ) -> anyhow::Result<Arc<Self>> {
         let pty_size = pty_size(size);
 
         let pair = native_pty_system().openpty(pty_size)?;
 
-        // Build the shell command. A configured `shell` wins; otherwise fall back
-        // to the platform default (the login shell on Unix, PowerShell on Windows).
-        let configured = crate::core::config::shell_command();
-        let (mut cmd, resolved_program) = match &configured {
+        // Build the shell command; `None` means the platform default (the login
+        // shell on Unix, PowerShell on Windows).
+        let configured = choose_shell(shell, crate::core::config::shell_command());
+        let mut cmd = match &configured {
             Some((program, args)) => {
                 let mut c = CommandBuilder::new(program);
                 c.args(args);
-                (c, program.clone())
+                c
             }
-            None => default_shell_command(),
+            None => default_prog(),
+        };
+        // The program tty7 is actually about to spawn, used (rather than `$SHELL`,
+        // which can disagree) to detect which shell integration applies. For a
+        // configured shell this is just its program string; for the platform
+        // default it's whatever `default_prog()` resolved (passwd/`$SHELL` on
+        // Unix, `powershell.exe` on Windows — see `default_shell_name`).
+        let resolved_program = match &configured {
+            Some((program, _)) => program.clone(),
+            None => default_shell_name(&cmd),
         };
 
         // Shell integration: inject OSC 7 / OSC 133 hooks (zsh/fish/bash/PowerShell
@@ -1144,6 +1179,27 @@ fn proc_name(pid: i32) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Spawn shell precedence: explicit override > configured > platform
+    /// default (`None`). Locks the contract stated on [`choose_shell`].
+    #[test]
+    fn choose_shell_prefers_override_then_config_then_default() {
+        let over = ShellSpec {
+            program: "fish".into(),
+            args: vec!["-l".into()],
+        };
+        let cfg = ("zsh".to_string(), vec!["-i".to_string()]);
+
+        // Override wins even when a shell is configured.
+        assert_eq!(
+            choose_shell(Some(over.clone()), Some(cfg.clone())),
+            Some(("fish".to_string(), vec!["-l".to_string()]))
+        );
+        // No override → the configured shell.
+        assert_eq!(choose_shell(None, Some(cfg.clone())), Some(cfg));
+        // Neither → platform default.
+        assert_eq!(choose_shell(None, None), None);
+    }
+
     #[test]
     fn arg_based_integration_rebuilds_default_shell_builder() {
         let mut cmd = CommandBuilder::new_default_prog();
@@ -1194,9 +1250,8 @@ mod tests {
     fn detected_shell_override_uses_explicit_command_builder() {
         let portable_shell = CommandBuilder::new_default_prog().get_shell();
         let detected_shell = format!("{portable_shell}-detected");
-        let (cmd, shell) = default_shell_command_with_override(Some(detected_shell.clone()));
+        let cmd = default_prog_with_override(Some(detected_shell.clone()));
 
-        assert_eq!(shell, detected_shell);
         assert!(!cmd.is_default_prog());
         let argv: Vec<_> = cmd
             .get_argv()
@@ -1209,10 +1264,10 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn no_detected_shell_keeps_portable_login_default() {
-        let (cmd, shell) = default_shell_command_with_override(None);
+        let cmd = default_prog_with_override(None);
 
         assert!(cmd.is_default_prog());
-        assert!(!shell.is_empty());
+        assert!(!default_shell_name(&cmd).is_empty());
     }
 
     /// A reader that finishes is joined and reported done — the common teardown
